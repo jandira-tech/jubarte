@@ -17,7 +17,7 @@ See [docs/maintainers/VERSIONING.md](docs/maintainers/VERSIONING.md) for the rel
 
 ## [0.20.0] - 2026-11-23
 
-> **Summary.** jubarte 0.20.0: drawing ids are unique across the whole document, so the redlines Windows Word 2024 refused as corrupt for repeated or shared drawing ids now open, and jubarte validate reports and repairs both shapes; dependencies refreshed. On the 600-pair and 860-document sets, scored against Word's own output: redlines mean 60.60 (Docxodus 71.67), counting as 0 the 9 redlines Windows Word 2024 refuses opening; PDFs mean 78.02 (LibreOffice 58.07) with no failed document. This release's redlines were exported to PDF by Windows Word 2024 through a remote endpoint, while Docxodus's and the references were exported by Mac Word 16.115; on the same Windows path 0.19.0 scored 58.94, so the redline figure is not comparable with 0.19.0's 74.02.
+> **Summary.** jubarte 0.20.0: drawing ids are unique across the whole document, so the redlines Windows Word 2024 refused as corrupt for repeated or shared drawing ids now open, and jubarte validate reports and repairs both shapes; dependencies refreshed. On the 600-pair and 860-document sets, scored against Word's own output: redlines mean 74.11 (Docxodus 71.67), counting as 0 the 3 redlines without a scored PDF, the same three as 0.19.0; PDFs mean 78.02 (LibreOffice 58.07) with no failed document. Every redline and reference was exported to PDF by Mac Word 16.115, as for 0.19.0. These notes first gave 60.60, from a Windows Word 2024 export on a server with no printer, where Word lays pages out at 96 dpi.
 >
 > **Docs.** CHANGELOG.md gains the 0.20.0 section; the library READMEs are cut again for v0.20.0; scripts/mini-release.sh documents itself in its header.
 
