@@ -25,7 +25,7 @@ use crate::util::group_adjacent;
 use crate::xmllinq::{Dom, NodeId, XName, XNamespace};
 
 use super::lcs::TaggedAtom;
-use super::{CorrelationStatus, WmlComparerSettings, lcs_table};
+use super::{CorrelationStatus, WmlComparerSettings, WordPlatform, lcs_table};
 
 static REV_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -1768,7 +1768,10 @@ fn source_containers(
 /// - each side's spans fit that side's grid: Word never records a span
 ///   that overflows it. Here the later cells give up their spans first. An
 ///   overflowing live row would also make the grid rebuild of
-///   [`rebuild_degenerate_grid`] replace the grid that Reject All restores.
+///   [`rebuild_degenerate_grid`] replace the grid that Reject All restores;
+/// - Windows Word 2024 marks the cells past the other side's count with
+///   `cellIns` / `cellDel` (#2548); Mac Word 16 writes none
+///   ([`mark_extra_cells`]).
 fn mesh_repartitioned_row(
     dom: &mut Dom,
     ne: NodeId,
@@ -1829,6 +1832,9 @@ fn mesh_repartitioned_row(
         };
         records.extend(record);
     }
+    // Before the cells take the revised properties: those are copied in
+    // front of a cell mark, as CT_TcPr orders them.
+    mark_extra_cells(dom, &lives, old, new, settings, id_gen);
     // Without a record, Reject All could not give the cell its own back.
     if settings.detect_format_changes {
         take_revision_cell_props(dom, &lives, &revision_cells(dom, g, level));
@@ -1836,6 +1842,53 @@ fn mesh_repartitioned_row(
     fit_spans(dom, &lives, row_grid_columns(dom, new));
     if records.len() == lives.len() {
         fit_spans(dom, &records, row_grid_columns(dom, old));
+    }
+}
+
+/// #2548: Windows Word 2024 marks the cells of a meshed row that one side
+/// does not have — those at or past the other side's cell count, the cells
+/// paired by position: the original's `w:cellDel`, the revision's
+/// `w:cellIns`. Mac Word 16 writes none (#1817), and equal counts mark
+/// nothing. `lives` are the row's `tcPr`s; `old` and `new` the original's
+/// and the revision's row.
+///
+/// A cell that already carries a mark keeps it: CT_TcPr allows one of
+/// `cellIns`, `cellDel` and `cellMerge`, after every other property and
+/// before `tcPrChange`, whose record (`CT_TcPrBase`) cannot hold it.
+fn mark_extra_cells(
+    dom: &mut Dom,
+    lives: &[NodeId],
+    old: NodeId,
+    new: NodeId,
+    settings: &WmlComparerSettings,
+    id_gen: &mut u32,
+) {
+    if settings.word_platform != WordPlatform::Windows {
+        return;
+    }
+    let old_cells = dom.elements(old, Some(&W::tc())).len();
+    let new_cells = dom.elements(new, Some(&W::tc())).len();
+    let name = match new_cells.cmp(&old_cells) {
+        std::cmp::Ordering::Greater => W::cell_ins(),
+        std::cmp::Ordering::Less => W::cell_del(),
+        std::cmp::Ordering::Equal => return,
+    };
+    for &live in lives.iter().skip(old_cells.min(new_cells)) {
+        if [W::cell_ins(), W::cell_del(), W::cell_merge()]
+            .iter()
+            .any(|carried| dom.element(live, carried).is_some())
+        {
+            continue;
+        }
+        let mark = dom.new_element(name.clone());
+        dom.set_attribute_value(mark, &W::id(), Some(&id_gen.to_string()));
+        *id_gen += 1;
+        dom.set_attribute_value(mark, &W::author(), Some(&settings.author_for_revisions));
+        dom.set_attribute_value(mark, &W::date(), Some(&settings.date_time_for_revisions));
+        match dom.element(live, &W::tc_pr_change()) {
+            Some(change) => dom.add_before_self(change, mark),
+            None => dom.add(live, mark),
+        }
     }
 }
 

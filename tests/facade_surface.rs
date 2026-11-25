@@ -99,6 +99,7 @@ use jubarte::comparer::WORD_LEVEL_KEPT_RATIO as _;
 use jubarte::comparer::WmlComparerRevision as _;
 use jubarte::comparer::WmlComparerRevisionType as _;
 use jubarte::comparer::WmlComparerSettings as _;
+use jubarte::comparer::WordPlatform as _;
 use jubarte::comparer::atomize as _;
 use jubarte::comparer::atomize::coalesce as _;
 use jubarte::comparer::atomize::create_comparison_unit_atom_list as _;

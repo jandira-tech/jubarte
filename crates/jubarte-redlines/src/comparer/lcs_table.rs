@@ -1150,6 +1150,330 @@ mod horizontal_partition_tests {
         }
     }
 
+    /// The parsed `word/document.xml` of a package.
+    fn document(bytes: &[u8]) -> (Dom, NodeId) {
+        let pkg = crate::opc::PartFs::open(bytes).unwrap();
+        let mut dom = Dom::new();
+        let doc = dom.parse_xdocument(&pkg.part_string("word/document.xml").unwrap());
+        let root = dom.root(doc).unwrap();
+        (dom, root)
+    }
+
+    /// #2548's settings: Windows Word 2024's platform, a named author and
+    /// date.
+    fn word_windows() -> WmlComparerSettings {
+        use crate::comparer::CompareMode;
+        WmlComparerSettings::new(CompareMode::WordWindows)
+            .with_author("Legal")
+            .with_date("2026-01-02T03:04:05Z")
+    }
+
+    /// A row of one cell per text, each in a column of its own.
+    fn text_row(texts: &[&str]) -> String {
+        const SHADES: [&str; 4] = ["AAAAAA", "BBBBBB", "CCCCCC", "DDDDDD"];
+        let count = texts.len();
+        let last = count - 1;
+        let cells = texts
+            .iter()
+            .enumerate()
+            .map(|(i, text)| {
+                cell(
+                    1,
+                    5000 / count as u32 + u32::from(i == last) * (5000 % count as u32),
+                    SHADES[i],
+                    text,
+                )
+            })
+            .collect::<String>();
+        table(&cells)
+    }
+
+    /// The meshed row of a comparison: one paired row, with no row `ins` or
+    /// `del`, of `larger` cells. A fixture that does not mesh fails here,
+    /// where the reason shows, not below on marks it would not have anyway.
+    fn meshed_cells(compared: &[u8], larger: usize, case: &str) -> (Dom, NodeId, Vec<MeshCell>) {
+        let (dom, root) = document(compared);
+        let (rows, _) = mesh_rows(&dom, root);
+        assert_eq!(rows.len(), 1, "{case}: one paired row: {rows:?}");
+        let (row_marks, cells) = rows.into_iter().next().unwrap();
+        assert!(
+            row_marks.is_empty(),
+            "{case}: no row ins/del: {row_marks:?}"
+        );
+        assert_eq!(
+            cells.len(),
+            larger,
+            "{case}: the larger cell count: {cells:?}"
+        );
+        (dom, root, cells)
+    }
+
+    /// The cell marks of each cell, in row order.
+    fn cell_marks(cells: &[MeshCell]) -> Vec<Vec<String>> {
+        cells.iter().map(|(marks, _, _, _)| marks.clone()).collect()
+    }
+
+    /// #2548: Windows Word 2024 marks the cells a meshed row has beyond the
+    /// other side's count — `expected` names the marks of each of the
+    /// row's cells — where Mac Word 16 (`--mode word`) writes none.
+    /// Returns the Windows comparison.
+    fn assert_marks_by_platform(
+        a: &[u8],
+        b: &[u8],
+        larger: usize,
+        expected: &[&[&str]],
+        case: &str,
+    ) -> Vec<u8> {
+        let expected: Vec<Vec<String>> = expected
+            .iter()
+            .map(|marks| marks.iter().map(|mark| mark.to_string()).collect())
+            .collect();
+        assert_eq!(
+            expected.len(),
+            larger,
+            "{case}: the fixture names every cell"
+        );
+        let none = vec![Vec::<String>::new(); larger];
+
+        // Mac Word 16 (#1817): no cellIns/cellDel, the larger cell count.
+        let compared = crate::document_comparer::compare_documents_with_settings(
+            a,
+            b,
+            &WmlComparerSettings::default(),
+        )
+        .unwrap();
+        let (_, _, cells) = meshed_cells(&compared, larger, &format!("word, {case}"));
+        assert_eq!(cell_marks(&cells), none, "word, {case}: no cell mark");
+
+        // Windows Word 2024 (#2548).
+        let settings = word_windows();
+        let compared =
+            crate::document_comparer::compare_documents_with_settings(a, b, &settings).unwrap();
+        let (dom, root, cells) = meshed_cells(&compared, larger, &format!("word-windows, {case}"));
+        assert_eq!(
+            cell_marks(&cells),
+            expected,
+            "word-windows, {case}: cell marks"
+        );
+
+        // Each mark is a revision of its own, on the live `tcPr` of a cell
+        // and before its record.
+        let marks: Vec<NodeId> = dom
+            .descendants(root, None)
+            .into_iter()
+            .filter(|&n| dom.name_is(n, &W::cell_ins()) || dom.name_is(n, &W::cell_del()))
+            .collect();
+        let marked = expected.iter().filter(|marks| !marks.is_empty()).count();
+        assert_eq!(
+            marks.len(),
+            marked,
+            "word-windows, {case}: one mark per marked cell"
+        );
+        for mark in marks {
+            assert_eq!(
+                dom.attribute(mark, &W::author()),
+                Some(settings.author_for_revisions.as_str()),
+                "word-windows, {case}: the mark's author"
+            );
+            assert_eq!(
+                dom.attribute(mark, &W::date()),
+                Some(settings.date_time_for_revisions.as_str()),
+                "word-windows, {case}: the mark's date"
+            );
+            let id: u32 = dom
+                .attribute(mark, &W::id())
+                .and_then(|id| id.parse().ok())
+                .unwrap_or_else(|| panic!("word-windows, {case}: the mark's w:id is a number"));
+            assert!(id > 0, "word-windows, {case}: the mark's w:id is positive");
+            let pr = dom.parent(mark).unwrap();
+            assert!(
+                dom.name_is(pr, &W::tc_pr()),
+                "word-windows, {case}: the mark sits in a tcPr"
+            );
+            assert!(
+                dom.parent(pr).is_some_and(|tc| dom.name_is(tc, &W::tc())),
+                "word-windows, {case}: a cell's live tcPr, not a record's"
+            );
+            let kids = dom.elements(pr, None);
+            let index = kids.iter().position(|&kid| kid == mark).unwrap();
+            for change in dom.elements(pr, Some(&W::tc_pr_change())) {
+                let record = kids.iter().position(|&kid| kid == change).unwrap();
+                assert!(
+                    index < record,
+                    "word-windows, {case}: the mark precedes tcPrChange"
+                );
+            }
+        }
+        // CT_TcPrChange holds CT_TcPrBase, which has no cell mark.
+        let records = dom.descendants(root, Some(&W::tc_pr_change()));
+        assert!(
+            !records.is_empty(),
+            "word-windows, {case}: the row records its old properties"
+        );
+        for change in records {
+            assert!(
+                dom.descendants(change, Some(&W::cell_ins())).is_empty()
+                    && dom.descendants(change, Some(&W::cell_del())).is_empty(),
+                "word-windows, {case}: no cell mark inside a tcPrChange"
+            );
+        }
+        compared
+    }
+
+    /// A sentence long enough that rows sharing it pair.
+    const PAIRING_TEXT: &str = "The first party shall deliver the complete report within thirty days after receiving the written request from the other party.";
+
+    /// #2548 on one pair of text rows: [`assert_marks_by_platform`] on
+    /// `original` against `revised`, one cell per text.
+    fn assert_pair(original: &[&str], revised: &[&str], expected: &[&[&str]], case: &str) {
+        let larger = original.len().max(revised.len());
+        assert_marks_by_platform(
+            &package(&text_row(original)),
+            &package(&text_row(revised)),
+            larger,
+            expected,
+            case,
+        );
+    }
+
+    /// #2548 — Windows Word 2024 marks a meshed row's cells beyond the other
+    /// side's count: the revision's `cellIns`, the original's `cellDel`. A
+    /// 3-cell row against the same row with a fourth: the revised cell
+    /// carries `cellIns`. Mac Word 16 writes none (#1817).
+    #[test]
+    fn word_windows_marks_the_revised_extra_cell_of_a_three_to_four_meshed_row() {
+        assert_pair(
+            &[PAIRING_TEXT, "Second cell", "Third cell"],
+            &[PAIRING_TEXT, "Second cell", "Third cell", "Fourth cell"],
+            &[&[], &[], &[], &["cellIns"]],
+            "3 -> 4",
+        );
+    }
+
+    /// #2548 — the reverse of the 3-to-4 row: the original's fourth cell
+    /// carries `cellDel`. Mac Word 16 writes none (#1817).
+    #[test]
+    fn word_windows_marks_the_original_extra_cell_of_a_four_to_three_meshed_row() {
+        assert_pair(
+            &[PAIRING_TEXT, "Second cell", "Third cell", "Fourth cell"],
+            &[PAIRING_TEXT, "Second cell", "Third cell"],
+            &[&[], &[], &[], &["cellDel"]],
+            "4 -> 3",
+        );
+    }
+
+    /// #2548 — a 4-cell row against its first two: the revised cells 3 and
+    /// 4 carry `cellIns`. Mac Word 16 writes none (#1817).
+    #[test]
+    fn word_windows_marks_the_revised_extra_cells_of_a_two_to_four_meshed_row() {
+        assert_pair(
+            &[PAIRING_TEXT, "Second cell"],
+            &[PAIRING_TEXT, "Second cell", "Third cell", "Fourth cell"],
+            &[&[], &[], &["cellIns"], &["cellIns"]],
+            "2 -> 4",
+        );
+    }
+
+    /// #2548 — the reverse of the 2-to-4 row: the original's cells 3 and 4
+    /// carry `cellDel`. Mac Word 16 writes none (#1817).
+    #[test]
+    fn word_windows_marks_the_original_extra_cells_of_a_four_to_two_meshed_row() {
+        assert_pair(
+            &[PAIRING_TEXT, "Second cell", "Third cell", "Fourth cell"],
+            &[PAIRING_TEXT, "Second cell"],
+            &[&[], &[], &["cellDel"], &["cellDel"]],
+            "4 -> 2",
+        );
+    }
+
+    /// #2548 — a repartition that moves a boundary but keeps the cell count
+    /// (1+2 columns against 2+1) marks no cell on either Word: a mark is
+    /// for a cell one side does not have.
+    #[test]
+    fn word_windows_marks_no_cell_while_the_cell_counts_are_equal() {
+        let long = PAIRING_TEXT;
+        let left = table(&(cell(1, 1600, "AAAAAA", long) + &cell(2, 3400, "BBBBBB", "Right")));
+        let right = table(&(cell(2, 3400, "CCCCCC", long) + &cell(1, 1600, "DDDDDD", "Right")));
+        for (original, revised, case) in
+            [(&left, &right, "1+2 -> 2+1"), (&right, &left, "2+1 -> 1+2")]
+        {
+            assert_marks_by_platform(&package(original), &package(revised), 2, &[&[], &[]], case);
+        }
+    }
+
+    /// #2548 — with the cell marks, accept and reject give each side its own
+    /// row back: the revised cell count and cell texts on accept, the
+    /// original's on reject, and no cell mark left in either.
+    #[test]
+    fn word_windows_mesh_cell_marks_reconcile_on_accept_and_reject() {
+        /// The first table's first row's cell count.
+        fn cells_of(bytes: &[u8]) -> usize {
+            geometry(bytes)
+                .into_iter()
+                .next()
+                .unwrap_or_default()
+                .into_iter()
+                .next()
+                .map_or(0, |(_, cells)| cells.len())
+        }
+        let reconcile = |original: &[&str], revised: &[&str], expected: &[&[&str]], case: &str| {
+            let a = package(&text_row(original));
+            let b = package(&text_row(revised));
+            let compared =
+                assert_marks_by_platform(&a, &b, original.len().max(revised.len()), expected, case);
+            let accepted = crate::document_comparer::accept_revisions(&compared).unwrap();
+            let rejected = crate::document_comparer::reject_revisions(&compared).unwrap();
+            assert_eq!(
+                cells_of(&accepted),
+                cells_of(&b),
+                "word-windows, {case}: accept gives the revised cell count"
+            );
+            assert_eq!(
+                cells_of(&rejected),
+                cells_of(&a),
+                "word-windows, {case}: reject gives the original cell count"
+            );
+            assert_eq!(
+                cell_texts(&accepted),
+                cell_texts(&b),
+                "word-windows, {case}: accepted cell texts"
+            );
+            assert_eq!(
+                cell_texts(&rejected),
+                cell_texts(&a),
+                "word-windows, {case}: rejected cell texts"
+            );
+            for (side, bytes) in [("accepted", &accepted), ("rejected", &rejected)] {
+                let (dom, root) = document(bytes);
+                assert!(
+                    dom.descendants(root, Some(&W::cell_ins())).is_empty(),
+                    "word-windows, {case}: {side} has no cellIns"
+                );
+                assert!(
+                    dom.descendants(root, Some(&W::cell_del())).is_empty(),
+                    "word-windows, {case}: {side} has no cellDel"
+                );
+            }
+        };
+        let two = [PAIRING_TEXT, "Second cell"];
+        let three = [PAIRING_TEXT, "Second cell", "Third cell"];
+        let four = [PAIRING_TEXT, "Second cell", "Third cell", "Fourth cell"];
+        reconcile(&three, &four, &[&[], &[], &[], &["cellIns"]], "3 -> 4");
+        reconcile(&four, &three, &[&[], &[], &[], &["cellDel"]], "4 -> 3");
+        reconcile(
+            &two,
+            &four,
+            &[&[], &[], &["cellIns"], &["cellIns"]],
+            "2 -> 4",
+        );
+        reconcile(
+            &four,
+            &two,
+            &[&[], &[], &["cellDel"], &["cellDel"]],
+            "4 -> 2",
+        );
+    }
+
     #[test]
     fn split_changed_prose_keeps_original_literal_space_and_tracks_its_new_boundary() {
         let original = "The second party shall deliver the updated report within sixty days after receiving the signed request from the first party.";

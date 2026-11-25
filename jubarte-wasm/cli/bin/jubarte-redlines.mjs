@@ -1053,7 +1053,9 @@ function stem(file) {
 function validateHost(name, o) {
   const reject = (flag) => { throw new UsageError(`--${flag.replaceAll("_", "-")} is not supported by the npm CLI`); };
   if (name === "compare") {
-    if ((o.mode ?? "word") !== "word" || o.powertools_faithful) reject("mode powertools");
+    const mode = o.mode ?? "word";
+    if (mode === "word-windows") reject("mode word-windows");
+    if (mode !== "word" || o.powertools_faithful) reject("mode powertools");
     if (o.detail_threshold != null) reject("detail_threshold");
     if (o.no_paragraph_merge) reject("no_paragraph_merge");
   }

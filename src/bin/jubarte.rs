@@ -3172,6 +3172,8 @@ struct Job {
     quiet: bool,
     detail_threshold: Option<f64>,
     powertools_faithful: bool,
+    /// The `word` preset on Windows Word's platform (`--mode word-windows`).
+    word_windows: bool,
     no_paragraph_merge: bool,
 }
 
@@ -3207,6 +3209,7 @@ fn resolve_compare(compare: CompareArgs, quiet: bool) -> Job {
         quiet,
         detail_threshold: compare.detail_threshold,
         powertools_faithful: compare.powertools_faithful || compare.mode == CompareMode::Powertools,
+        word_windows: compare.mode == CompareMode::WordWindows,
         no_paragraph_merge: compare.no_paragraph_merge,
     }
 }
@@ -3232,12 +3235,17 @@ fn comparer_settings(
     date: &str,
     detail_threshold: Option<f64>,
     powertools_faithful: bool,
+    word_windows: bool,
     no_paragraph_merge: bool,
 ) -> jubarte::comparer::WmlComparerSettings {
     let base = if powertools_faithful {
         jubarte::comparer::WmlComparerSettings::powertools_faithful()
     } else {
-        jubarte::comparer::WmlComparerSettings::default()
+        jubarte::comparer::WmlComparerSettings::new(if word_windows {
+            jubarte::comparer::CompareMode::WordWindows
+        } else {
+            jubarte::comparer::CompareMode::Word
+        })
     };
     jubarte::comparer::WmlComparerSettings {
         author_for_revisions: author.to_string(),
@@ -3279,6 +3287,7 @@ fn run(job: &Job) -> Result<(), ConvertFailure> {
         &job.date,
         job.detail_threshold,
         job.powertools_faithful,
+        job.word_windows,
         job.no_paragraph_merge,
     );
     let old = Input::new(
@@ -4772,6 +4781,7 @@ fn cli_main() -> ExitCode {
                     None,
                     false,
                     false,
+                    false,
                 ),
                 patch: (format == PatchFormat::Patch).then_some(columns),
                 quiet,
@@ -5572,6 +5582,52 @@ mod tests {
         );
         assert!(
             Cli::try_parse_from(["jubarte", "a.docx", "b.docx", "--mode", "libreoffice"]).is_err()
+        );
+    }
+
+    /// #2547: `--mode word-windows` is `--mode word` on Windows Word's
+    /// platform. The flag reaches the comparer as that one field, so the
+    /// default `--mode word` redline does not move; `--mode powertools`
+    /// ignores it.
+    #[test]
+    fn word_windows_mode_sets_only_the_platform() {
+        let windows = job_of(&["jubarte", "a.docx", "b.docx", "--mode", "word-windows"]);
+        assert!(windows.word_windows);
+        assert!(!windows.powertools_faithful);
+        for args in [
+            vec!["jubarte", "a.docx", "b.docx"],
+            vec!["jubarte", "a.docx", "b.docx", "--mode", "word"],
+            vec!["jubarte", "a.docx", "b.docx", "--mode", "powertools"],
+        ] {
+            assert!(!job_of(&args).word_windows, "{args:?}");
+        }
+        use jubarte::comparer::WordPlatform;
+        // (author, date, detail threshold, powertools, word-windows,
+        // no paragraph merge)
+        let windows = comparer_settings("A", "D", None, false, true, false);
+        assert_eq!(windows.word_platform, WordPlatform::Windows);
+        let mac = comparer_settings("A", "D", None, false, false, false);
+        assert_eq!(mac.word_platform, WordPlatform::Mac);
+        // `WmlComparerSettings` has no `PartialEq` (it carries `f64`s); its
+        // `Debug` rendering covers every field.
+        let normalised = jubarte::comparer::WmlComparerSettings {
+            word_platform: WordPlatform::Mac,
+            ..windows
+        };
+        assert_eq!(
+            format!("{normalised:?}"),
+            format!("{mac:?}"),
+            "the platform is the only difference"
+        );
+        let powertools = comparer_settings("A", "D", None, true, true, false);
+        assert_eq!(powertools.word_platform, WordPlatform::Mac);
+        assert_eq!(
+            format!("{powertools:?}"),
+            format!(
+                "{:?}",
+                comparer_settings("A", "D", None, true, false, false)
+            ),
+            "powertools wins over the platform"
         );
     }
 

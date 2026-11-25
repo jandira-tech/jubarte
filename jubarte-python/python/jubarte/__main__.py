@@ -1647,7 +1647,10 @@ class SharedParser:
     def _validate_host(self, command: str, values: dict) -> None:
         # Capability checks only, never an alternate option grammar.
         if command == "compare":
-            if values.get("mode", "word") != "word" or values.get("powertools_faithful"):
+            mode = values.get("mode", "word")
+            if mode == "word-windows":
+                self.error("--mode word-windows is not supported by the Python CLI")
+            if mode != "word" or values.get("powertools_faithful"):
                 self.error("--mode powertools is not supported by the Python CLI")
             if values.get("detail_threshold") is not None:
                 self.error("--detail-threshold is not supported by the Python CLI")

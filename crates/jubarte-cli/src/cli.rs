@@ -2060,6 +2060,9 @@ pub enum CompareMode {
     /// Microsoft Word Compare's layout: word-level detail, replaced paragraphs
     /// merged, Word's alignment passes.
     Word,
+    /// Windows Word 2024 Compare's layout: word mode plus the places where
+    /// Windows Word's redline differs from Mac Word's.
+    WordWindows,
     /// Open-Xml-PowerTools: coarse paragraph fallback (threshold 0.15), no
     /// Word alignment passes.
     Powertools,

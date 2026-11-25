@@ -18,7 +18,7 @@
 //!   non-panicking `try_compare_bodies_faithful_with_notes`.
 //! - Types: `NotesContext`, `CorrelationStatus`, `ComparisonUnitGroupType`,
 //!   `WmlComparerRevisionType`, `WmlComparerSettings`, `CompareMode`,
-//!   `CompareContext`.
+//!   `WordPlatform`, `CompareContext`.
 //! - Re-exports: `WmlComparerRevision` from `atoms`.
 //! - Constants: `PREDELETE_STAMP_ORIG`, `PREDELETE_STAMP_REV`,
 //!   `DEFAULT_AUTHOR_FOR_REVISIONS`, `DEFAULT_DETAIL_THRESHOLD`,
@@ -1408,22 +1408,40 @@ pub enum WmlComparerRevisionType {
 /// `WmlComparerSettings.DefaultAuthorForRevisions`.
 pub const DEFAULT_AUTHOR_FOR_REVISIONS: &str = "Open-Xml-PowerTools";
 
-/// The two supported comparer configurations. Each is an oracle the
+/// The three supported comparer configurations. Each is an oracle the
 /// output is tested against; the alignment gates between them are not
 /// meant to be mixed (see [`WmlComparerSettings::merge_replaced_paragraphs`]).
 ///
-/// `jubarte compare --mode word` and `--mode powertools` select these
-/// presets; the package-level `compare_documents_with_settings` takes the
-/// raw settings struct instead.
+/// `jubarte compare --mode word`, `--mode word-windows` and `--mode powertools`
+/// select these presets; the package-level `compare_documents_with_settings`
+/// takes the raw settings struct instead.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub enum CompareMode {
     /// Word's own Compare semantics — see [`WmlComparerSettings::default`].
     #[default]
     Word,
+    /// Word's own Compare semantics on Windows Word 2024 — the
+    /// [`Word`](Self::Word) preset with
+    /// [`WmlComparerSettings::word_platform`] set to
+    /// [`WordPlatform::Windows`]; the places where Windows Word's redline
+    /// differs from Mac Word 16's read that field (#2547, #2548).
+    WordWindows,
     /// PowerTools-faithful preset used by the C# arbiter and the
     /// `--detail-threshold=0.15` goldens — see
     /// [`WmlComparerSettings::powertools_faithful`].
     PowerTools,
+}
+
+/// Which Word's Compare the `word` preset follows. Mac Word 16 is the
+/// default; Windows Word 2024 differs in the places that read
+/// [`WmlComparerSettings::word_platform`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum WordPlatform {
+    /// Mac Word 16's Compare, the `word` preset's reference.
+    #[default]
+    Mac,
+    /// Windows Word 2024's Compare.
+    Windows,
 }
 
 /// Comparer configuration (port of `WmlComparerSettings`,
@@ -1449,6 +1467,9 @@ pub struct WmlComparerSettings {
     /// Word-visual default is [`DEFAULT_DETAIL_THRESHOLD`] (0.02),
     /// PowerTools-faithful preset uses 0.15.
     pub detail_threshold: f64,
+    /// Which Word's Compare the word preset follows; see [`WordPlatform`]
+    /// (Windows Word 2024 differs in the places that read this field).
+    pub word_platform: WordPlatform,
     /// Word-key comparison case-folds ASCII letters when `true`.
     pub case_insensitive: bool,
     /// Treat `' '` and `'\u{A0}'` as the same word separator.
@@ -1518,6 +1539,10 @@ impl WmlComparerSettings {
     pub fn new(mode: CompareMode) -> Self {
         match mode {
             CompareMode::Word => Self::default(),
+            CompareMode::WordWindows => Self {
+                word_platform: WordPlatform::Windows,
+                ..Self::default()
+            },
             CompareMode::PowerTools => Self::powertools_faithful(),
         }
     }
@@ -1587,6 +1612,7 @@ impl Default for WmlComparerSettings {
             // PowerTools-faithful runs use
             // `WmlComparerSettings::powertools_faithful()` (0.15).
             detail_threshold: DEFAULT_DETAIL_THRESHOLD,
+            word_platform: WordPlatform::Mac,
             case_insensitive: false,
             conflate_breaking_and_nonbreaking_spaces: true,
             starting_id_for_footnotes_endnotes: 1,
@@ -2036,5 +2062,47 @@ mod body_section_source_ownership_tests {
                 "the final body section never belongs to a table cell"
             );
         }
+    }
+}
+
+#[cfg(test)]
+#[cfg_attr(all(coverage_nightly, test), coverage(off))]
+mod compare_mode_tests {
+    use super::*;
+
+    /// `WmlComparerSettings` has no `PartialEq` (it carries `f64`s); its
+    /// `Debug` rendering covers every field.
+    fn same(a: &WmlComparerSettings, b: &WmlComparerSettings) -> bool {
+        format!("{a:?}") == format!("{b:?}")
+    }
+
+    /// #2547: `word-windows` is the `word` preset on Windows Word's
+    /// platform, and nothing else — the platform field is the only one it
+    /// adds, so Mac Word 16's redline (`--mode word`, the default) does not
+    /// move. PowerTools stays on the Mac platform.
+    #[test]
+    fn compare_mode_word_windows_is_the_word_preset_on_windows_word() {
+        let windows = WmlComparerSettings::new(CompareMode::WordWindows);
+        assert_eq!(windows.word_platform, WordPlatform::Windows);
+        assert_eq!(
+            WmlComparerSettings::new(CompareMode::Word).word_platform,
+            WordPlatform::Mac
+        );
+        assert_eq!(
+            WmlComparerSettings::powertools_faithful().word_platform,
+            WordPlatform::Mac
+        );
+        assert_eq!(
+            WmlComparerSettings::default().word_platform,
+            WordPlatform::Mac
+        );
+        assert_eq!(WordPlatform::default(), WordPlatform::Mac);
+        assert_eq!(CompareMode::default(), CompareMode::Word);
+        let a = WmlComparerSettings {
+            word_platform: WordPlatform::Mac,
+            ..windows
+        };
+        let b = WmlComparerSettings::new(CompareMode::Word);
+        assert!(same(&a, &b), "{a:?}\n{b:?}");
     }
 }
