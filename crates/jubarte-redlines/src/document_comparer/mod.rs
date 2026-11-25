@@ -15,7 +15,7 @@
 //! runs PreProcessMarkup/accept/hash and relocates footnotes/comments/related
 //! parts (the M4.5–M4.6 refinements) for exact golden parity on complex docs.
 
-use crate::comparer::{WmlComparerSettings, compare_bodies_faithful};
+use crate::comparer::{WmlComparerSettings, WordPlatform, compare_bodies_faithful};
 use crate::namespaces::{R, W, W14};
 use crate::opc::{OpcError, PartFs};
 use crate::xmllinq::{Dom, NodeId, XName};
@@ -829,12 +829,22 @@ fn compare_documents_impl(
         crate::comparer::finalize::fix_up_revision_ids(&mut dom, &[result_root]);
     }
 
-    // M472 — re-assert Word's ins-before-del replacement order after the
-    // comment-carry rebuilds run blocks (diff_before10 × diff_before11: the
-    // early reorder's work was undone by comment anchoring, leaving
-    // [ins][del][ins] where Word emits ins…ins del). Idempotent and
+    // M472 — re-assert Word's replacement order after the comment-carry
+    // rebuilds run blocks (diff_before10 × diff_before11: the early
+    // reorder's work was undone by comment anchoring, leaving
+    // [ins][del][ins] where Word emits ins…ins del). Mac Word writes the
+    // insertion first; Windows Word 2024 the deletion first, between the
+    // paragraphs of a replaced block too (#2550). Idempotent and
     // text-preserving.
-    crate::comparer::finalize::reorder_replacements_ins_before_del(&mut dom, result_root);
+    if settings.word_platform == WordPlatform::Windows {
+        crate::comparer::finalize::reorder_deletions_before_insertions(&mut dom, result_root);
+        crate::comparer::finalize::reorder_deleted_paragraphs_before_inserted(
+            &mut dom,
+            result_root,
+        );
+    } else {
+        crate::comparer::finalize::reorder_replacements_ins_before_del(&mut dom, result_root);
+    }
 
     // Word mode: the deleted rows of a paired table whose style or layout
     // changed become tables of their own, as in Word's redlines (#1817).
@@ -854,6 +864,13 @@ fn compare_documents_impl(
     // some such redlines. After the comment carry and M472, which rebuild
     // runs; the bookmarks below are carried around the moved runs.
     crate::comparer::deleted_tables::move_inserted_text_past_deleted_tables(&mut dom, result_root);
+    // That pass puts the moved insertions first in their new paragraph.
+    // Windows Word writes a paragraph's deletion before its insertions
+    // (#2550), so its order is asserted once more, before the bookmarks
+    // below are carried around the runs as they stand.
+    if settings.word_platform == WordPlatform::Windows {
+        crate::comparer::finalize::reorder_deletions_before_insertions(&mut dom, result_root);
+    }
 
     // M463 — rewrite outer-wrapped math revisions into Word's internal form.
     // Must run after every mesh/finalize pass (they reason about the outer

@@ -1187,6 +1187,11 @@ mod consecutive_block_splice_tests;
 
 #[cfg(test)]
 #[cfg_attr(all(coverage_nightly, test), coverage(off))]
+#[path = "tests/windows_del_before_ins_tests.rs"]
+mod windows_del_before_ins_tests;
+
+#[cfg(test)]
+#[cfg_attr(all(coverage_nightly, test), coverage(off))]
 #[path = "tests/demo_title_pilcrow_history_tests.rs"]
 mod demo_title_pilcrow_history_tests;
 

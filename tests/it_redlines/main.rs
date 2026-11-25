@@ -66,6 +66,7 @@ mod m228_mid_pure_del_spacing_promote;
 mod m22_alternate_content_resolve;
 mod m23_nested_table_run_nesting;
 mod m24_strict_namespaces;
+mod m2550_windows_del_before_ins;
 mod m25_sanitize_sdt_pr;
 mod m26_paragraph_mark_order;
 mod m27_namespace_prefix_preserve;

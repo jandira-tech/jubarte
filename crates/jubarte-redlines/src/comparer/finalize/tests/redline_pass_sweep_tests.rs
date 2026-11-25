@@ -282,6 +282,8 @@ fn passes() -> Vec<Pass> {
         residual_short_label_zip,
         interleave_list_cluster_after_coalesce,
         reorder_replaced_blocks,
+        reorder_deletions_before_insertions,
+        reorder_deleted_paragraphs_before_inserted,
         coalesce_all_paragraphs,
         fix_paragraph_mark_revision_order,
         strip_trailing_empty_pure_del_mark,

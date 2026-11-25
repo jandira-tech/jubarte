@@ -121,6 +121,174 @@ pub fn revision_wrapper(dom: &Dom, node: NodeId) -> Option<(bool, String, String
     found
 }
 
+/// Windows Word 2024 writes every replacement DELETION first and the
+/// INSERTION after it, the reverse of Mac Word's order, which
+/// [`reorder_replacements_ins_before_del`] writes. Under every element
+/// except `w:rPr`, `w:pPr` and `w:trPr` (whose `w:ins` / `w:del` are
+/// property revisions in schema order), take each maximal run of adjacent
+/// `w:ins` / `w:del` children that holds both kinds and stable-partition it:
+/// every `w:del` before every `w:ins`, the order inside each kind kept. The
+/// deleted and the inserted text each read as before; only their
+/// interleaving changes. A run in which any wrapper holds part of a field
+/// stays as it is ([`fields_complete`]): trading a deleted field's `end`
+/// for an inserted field's `begin` crosses the two fields, and Word refused
+/// the redline. Recurses into every child. Idempotent and text-preserving
+/// (#2550).
+pub fn reorder_deletions_before_insertions(dom: &mut Dom, node: NodeId) {
+    let fld_char = W::fld_char();
+    let (ins, del) = (W::ins(), W::del());
+    let property_bag = [W::r_pr(), W::p_pr(), W::tr_pr()];
+    if dom.child_count(node) > 1 && dom.name(node).is_none_or(|n| !property_bag.contains(&n)) {
+        let kids = dom.nodes(node);
+        let mut start = 0;
+        while start < kids.len() {
+            if !is_ins_or_del(dom, kids[start]) {
+                start += 1;
+                continue;
+            }
+            let mut end = start;
+            while end < kids.len() && is_ins_or_del(dom, kids[end]) {
+                end += 1;
+            }
+            let run = &kids[start..end];
+            let has_del = run.iter().any(|&c| dom.name_is(c, &del));
+            let has_ins = run.iter().any(|&c| dom.name_is(c, &ins));
+            if has_del && has_ins && run.iter().all(|&c| fields_complete(dom, c, &fld_char)) {
+                let (dels, inss): (Vec<NodeId>, Vec<NodeId>) =
+                    run.iter().copied().partition(|&c| dom.name_is(c, &del));
+                let order: Vec<NodeId> = dels.into_iter().chain(inss).collect();
+                order_siblings(dom, node, run, &order, kids.get(end).copied());
+            }
+            start = end;
+        }
+    }
+    for c in dom.nodes(node) {
+        if dom.is_element(c) {
+            reorder_deletions_before_insertions(dom, c);
+        }
+    }
+}
+
+/// Windows Word 2024 writes the DELETED paragraphs of a replaced block
+/// before the inserted ones. [`reorder_replaced_blocks`] and the merge
+/// passes write Mac Word's order, the inserted block first; the Windows
+/// pipeline runs this pass in their place, once they have settled the
+/// paragraphs. Under every `w:body`, `w:tc`, `w:footnote`, `w:endnote`,
+/// `w:hdr` and `w:ftr`, take each maximal run of adjacent whole-deleted and
+/// whole-inserted paragraphs that holds both kinds and stable-partition it,
+/// deletions first.
+///
+/// A paragraph is whole-deleted when its mark is deleted (`w:pPr/w:rPr/w:del`
+/// and no `w:ins` there) and every `w:r` in it has a `w:del` for its direct
+/// parent; whole-inserted is the same with the two swapped. A paragraph
+/// with no run counts by its mark alone. Any other node, a mixed paragraph
+/// or one whose mark and runs disagree ends the run. Stable, so accepting
+/// and rejecting each read the same text as before. Idempotent (#2550).
+pub fn reorder_deleted_paragraphs_before_inserted(dom: &mut Dom, root: NodeId) {
+    let containers = [
+        W::body(),
+        W::tc(),
+        W::footnote(),
+        W::endnote(),
+        W::hdr(),
+        W::ftr(),
+    ];
+    for container in dom.descendants_and_self(root, None) {
+        if !dom.name(container).is_some_and(|n| containers.contains(&n)) {
+            continue;
+        }
+        let kids: Vec<(NodeId, Option<bool>)> = dom
+            .nodes(container)
+            .into_iter()
+            .map(|k| (k, whole_revision_kind(dom, k)))
+            .collect();
+        let mut start = 0;
+        while start < kids.len() {
+            if kids[start].1.is_none() {
+                start += 1;
+                continue;
+            }
+            let mut end = start;
+            while end < kids.len() && kids[end].1.is_some() {
+                end += 1;
+            }
+            let run = &kids[start..end];
+            let deleted = run.iter().any(|&(_, k)| k == Some(false));
+            let inserted = run.iter().any(|&(_, k)| k == Some(true));
+            if deleted && inserted {
+                let members: Vec<NodeId> = run.iter().map(|&(k, _)| k).collect();
+                let order: Vec<NodeId> = run
+                    .iter()
+                    .filter(|&&(_, k)| k == Some(false))
+                    .chain(run.iter().filter(|&&(_, k)| k == Some(true)))
+                    .map(|&(k, _)| k)
+                    .collect();
+                order_siblings(
+                    dom,
+                    container,
+                    &members,
+                    &order,
+                    kids.get(end).map(|&(k, _)| k),
+                );
+            }
+            start = end;
+        }
+    }
+}
+
+/// `Some(false)` for a paragraph that is wholly deleted, `Some(true)` for
+/// one wholly inserted and `None` for anything else; the paragraphs
+/// [`reorder_deleted_paragraphs_before_inserted`] trades.
+fn whole_revision_kind(dom: &Dom, p: NodeId) -> Option<bool> {
+    if !dom.name_is(p, &W::p()) {
+        return None;
+    }
+    let mark = dom
+        .element(p, &W::p_pr())
+        .and_then(|ppr| dom.element(ppr, &W::r_pr()));
+    let mark_has = |rev: &XName| mark.is_some_and(|m| dom.element(m, rev).is_some());
+    let (mark_ins, mark_del) = (mark_has(&W::ins()), mark_has(&W::del()));
+    if mark_ins == mark_del {
+        return None;
+    }
+    let runs = dom.descendants(p, Some(&W::r()));
+    let wrapper = if mark_ins { W::ins() } else { W::del() };
+    runs.iter()
+        .all(|&r| {
+            dom.parent(r)
+                .is_some_and(|parent| dom.name_is(parent, &wrapper))
+        })
+        .then_some(mark_ins)
+}
+
+fn is_ins_or_del(dom: &Dom, node: NodeId) -> bool {
+    dom.name_is(node, &W::ins()) || dom.name_is(node, &W::del())
+}
+
+/// Move `order`, a permutation of the adjacent children `run` of `parent`,
+/// into that order where the run stands. `after` is the sibling that follows
+/// the run, when the run is not the parent's last children.
+fn order_siblings(
+    dom: &mut Dom,
+    parent: NodeId,
+    run: &[NodeId],
+    order: &[NodeId],
+    after: Option<NodeId>,
+) {
+    if order == run {
+        return;
+    }
+    for &c in run {
+        dom.remove(c);
+    }
+    for &c in order {
+        match after {
+            Some(next) => dom.add_before_self(next, c),
+            None => dom.add(parent, c),
+        }
+    }
+}
+
 /// Merge consecutive sibling `w:ins` (and consecutive `w:del`) wrappers that
 /// share the same `w:author` and `w:date` into a single wrapper, moving the
 /// later wrapper's child runs into the first and removing the emptied wrapper.

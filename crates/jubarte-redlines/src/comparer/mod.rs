@@ -1046,8 +1046,14 @@ pub fn try_compare_bodies_faithful_with_notes(
     // moveTo first in the paraRPr, and the paraRPr after pStyle/content props.
     // Otherwise Word reports "unreadable content" (ooxmlsdk tolerates it).
     finalize::fix_paragraph_mark_revision_order(dom, root);
-    // Match Word's replacement order: insertion (new) before deletion (old).
-    finalize::reorder_replacements_ins_before_del(dom, root);
+    // Match Word's replacement order. Mac Word writes the insertion (new)
+    // before the deletion (old); Windows Word 2024 the deletion first
+    // (#2550).
+    if settings.word_platform == WordPlatform::Windows {
+        finalize::reorder_deletions_before_insertions(dom, root);
+    } else {
+        finalize::reorder_replacements_ins_before_del(dom, root);
+    }
     // Merge adjacent same-status w:ins/w:del wrappers into one (Word never emits
     // adjacent same-status revisions; we otherwise inflate element count ~2x).
     // Text-preserving, so golden text-parity is unaffected.
@@ -1059,7 +1065,13 @@ pub fn try_compare_bodies_faithful_with_notes(
     // Word-alignment mode (settings-gated, default OFF — PowerTools-faithful
     // runs never take this): merge fully-replaced paragraph pairs like Word.
     if settings.merge_replaced_paragraphs {
-        finalize::reorder_replaced_blocks(dom, root);
+        // `reorder_replaced_blocks` writes the inserted block first, Mac
+        // Word's order. Windows Word writes the deleted block first:
+        // `reorder_deleted_paragraphs_before_inserted` does that at the end
+        // of this block, once the passes below have settled the paragraphs.
+        if settings.word_platform != WordPlatform::Windows {
+            finalize::reorder_replaced_blocks(dom, root);
+        }
         // Short pure-D base trailing after insert-all-next → splice mid-stream
         // near TOC/tip (document_100×comments; Word nests original on page 2).
         finalize::splice_trailing_short_pure_dels_midstream(dom, root);
@@ -1310,6 +1322,15 @@ pub fn try_compare_bodies_faithful_with_notes(
             finalize::strip_unrecorded_word_defaults(dom, root, lines.0.as_deref());
             finalize::align_word_table_and_comment_chrome(dom, root);
         }
+        // #2550: Windows Word 2024 writes deletions before insertions, in a
+        // paragraph and between the paragraphs of a replaced block. The
+        // passes above rebuild Mac Word's order as they work, so this runs
+        // once they are done. Headers, footers and text boxes are compared
+        // through this function and get no later re-assert.
+        if settings.word_platform == WordPlatform::Windows {
+            finalize::reorder_deletions_before_insertions(dom, root);
+            finalize::reorder_deleted_paragraphs_before_inserted(dom, root);
+        }
     }
     // Word marks a changed text box's words inside the one box; the diff
     // sees the box as one opaque run and deletes and inserts it whole.
@@ -1424,7 +1445,7 @@ pub enum CompareMode {
     /// [`Word`](Self::Word) preset with
     /// [`WmlComparerSettings::word_platform`] set to
     /// [`WordPlatform::Windows`]; the places where Windows Word's redline
-    /// differs from Mac Word 16's read that field (#2547, #2548).
+    /// differs from Mac Word 16's read that field (#2547, #2548, #2550).
     WordWindows,
     /// PowerTools-faithful preset used by the C# arbiter and the
     /// `--detail-threshold=0.15` goldens — see

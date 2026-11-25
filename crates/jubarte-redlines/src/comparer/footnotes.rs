@@ -865,6 +865,13 @@ fn finalize_notes_part(
     // notes parts don't ship powertools markup Word must ignore.
     super::finalize::remove_powertools_scratch_markup(dom, root);
     super::finalize::ignore_pt14_namespace(dom, root);
+    // #2550: Windows Word writes a replacement's deletion first, in the
+    // notes as in the body. No pass on this path writes an insertion ahead
+    // of a deletion today, in either mode; this keeps it so if one does.
+    if settings.word_platform == super::WordPlatform::Windows {
+        super::finalize::reorder_deletions_before_insertions(dom, root);
+        super::finalize::reorder_deleted_paragraphs_before_inserted(dom, root);
+    }
 }
 
 struct RectifyPlan {
