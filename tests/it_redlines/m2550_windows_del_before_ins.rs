@@ -467,3 +467,267 @@ fn footnotes_read_deletions_first_in_word_windows() {
     assert_deletions_first(&part(&out, "word/footnotes.xml"), "word-windows footnotes");
     crate::common::validity::assert_word_valid_package(&out);
 }
+
+// ---- #2555 ----
+
+/// A package whose one body paragraph holds a VML text box saying `box_text`.
+fn with_text_box(box_text: &str) -> Vec<u8> {
+    let body = format!(
+        r#"<w:p><w:r><w:t>Intro paragraph here.</w:t></w:r></w:p><w:p><w:r><w:pict><v:shape xmlns:v="urn:schemas-microsoft-com:vml" id="TextBox 1" style="width:200pt;height:20pt"><v:textbox><w:txbxContent><w:p><w:r><w:t xml:space="preserve">{box_text}</w:t></w:r></w:p></w:txbxContent></v:textbox></v:shape></w:pict></w:r></w:p><w:p><w:r><w:t>After paragraph here.</w:t></w:r></w:p>"#
+    );
+    docx::docx(&body)
+}
+
+/// A changed text box keeps the one box, and the words inside it read the
+/// deletion before the insertion in `word-windows` (#2555: the graft that
+/// re-diffs the box's story is followed by the Windows re-assert, and the
+/// block pass walks `w:txbxContent`). Mac Word's order, the insertion
+/// first, stays what `word` writes.
+#[test]
+fn a_changed_text_box_reads_deletions_first_in_word_windows() {
+    let original = with_text_box("Overall purpose of the post");
+    let revised = with_text_box("Overall aim of the post");
+
+    let out = redline(&original, &revised, CompareMode::WordWindows);
+    let (dom, root) = parse(&part(&out, "word/document.xml"));
+    let boxes: Vec<NodeId> = dom
+        .descendants(root, Some(&W::name("txbxContent")))
+        .into_iter()
+        .filter(|&b| dom.elements(b, Some(&W::p())).len() == 1)
+        .collect();
+    assert_eq!(boxes.len(), 1, "the one kept box");
+    assert_eq!(
+        markup(&dom, dom.elements(boxes[0], Some(&W::p()))[0]),
+        [
+            ('x', "Overall ".to_string()),
+            ('d', "purpose".to_string()),
+            ('i', "aim".to_string()),
+            ('x', " of the post".to_string()),
+        ]
+    );
+    assert_deletions_first(&part(&out, "word/document.xml"), "word-windows box");
+    crate::common::validity::assert_word_valid_package(&out);
+
+    let out = redline(&original, &revised, CompareMode::Word);
+    let (dom, root) = parse(&part(&out, "word/document.xml"));
+    let boxes: Vec<NodeId> = dom
+        .descendants(root, Some(&W::name("txbxContent")))
+        .into_iter()
+        .filter(|&b| dom.elements(b, Some(&W::p())).len() == 1)
+        .collect();
+    assert_eq!(
+        markup(&dom, dom.elements(boxes[0], Some(&W::p()))[0]),
+        [
+            ('x', "Overall ".to_string()),
+            ('i', "aim".to_string()),
+            ('d', "purpose".to_string()),
+            ('x', " of the post".to_string()),
+        ],
+        "Mac Word 16 writes the insertion first"
+    );
+}
+
+/// A package whose one body paragraph holds `text` plus an external
+/// hyperlink reading `link_text` (a real `w:hyperlink` element, which the
+/// redline keeps as one instead of rewriting it into a field).
+fn with_external_link(text: &str, link_text: &str) -> Vec<u8> {
+    use std::io::{Cursor, Write};
+    use zip::{ZipWriter, write::SimpleFileOptions};
+    let body = format!(
+        r#"<w:p><w:r><w:t xml:space="preserve">{text} </w:t></w:r><w:hyperlink r:id="rId7"><w:r><w:rPr><w:rStyle w:val="Hyperlink"/></w:rPr><w:t xml:space="preserve">{link_text}</w:t></w:r></w:hyperlink></w:p>"#
+    );
+    let document = format!(
+        r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:document xmlns:w="{W_NS}" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><w:body>{body}<w:sectPr><w:pgSz w:w="12240" w:h="15840"/></w:sectPr></w:body></w:document>"#
+    );
+    let ct = br#"<?xml version="1.0"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/></Types>"#;
+    let rels = br#"<?xml version="1.0"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/></Relationships>"#;
+    let doc_rels = br#"<?xml version="1.0"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId7" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/hyperlink" Target="https://example.com/" TargetMode="External"/></Relationships>"#;
+    let mut buf = Cursor::new(Vec::new());
+    {
+        let mut z = ZipWriter::new(&mut buf);
+        let opt = SimpleFileOptions::default();
+        for (name, data) in [
+            ("[Content_Types].xml", ct.as_slice()),
+            ("_rels/.rels", rels.as_slice()),
+            ("word/document.xml", document.as_bytes()),
+            ("word/_rels/document.xml.rels", doc_rels.as_slice()),
+        ] {
+            z.start_file(name, opt).unwrap();
+            z.write_all(data).unwrap();
+        }
+        z.finish().unwrap();
+    }
+    buf.into_inner()
+}
+
+/// A deleted external hyperlink reads before the insertion that replaces
+/// it (#2555: the inline pass orders an all-one-kind hyperlink with its
+/// kind, so the link is a deletion the insertion follows).
+#[test]
+fn a_deleted_external_hyperlink_precedes_the_insertion_replacing_it() {
+    let original = with_external_link("See", "Click here now");
+    let revised = docx::docx(&para("See One two"));
+    let out = redline(&original, &revised, CompareMode::WordWindows);
+    let (dom, root) = parse(&part(&out, "word/document.xml"));
+    let p = body_paragraphs(&dom, root)[0];
+    let names: Vec<String> = dom
+        .elements(p, None)
+        .into_iter()
+        .filter(|&c| !dom.name_is(c, &W::p_pr()))
+        .filter_map(|c| dom.name(c).map(|n| n.local_name().to_string()))
+        .collect();
+    assert_eq!(
+        names,
+        ["r", "hyperlink", "ins"],
+        "the deleted link first, the insertion after it"
+    );
+    let link = dom
+        .elements(p, Some(&W::hyperlink()))
+        .into_iter()
+        .next()
+        .unwrap();
+    assert_eq!(
+        markup(&dom, link),
+        [('d', "Click here now".to_string())],
+        "the link's text is deleted"
+    );
+    assert_deletions_first(&part(&out, "word/document.xml"), "word-windows link");
+    crate::common::validity::assert_word_valid_package(&out);
+}
+
+// ---- #2555, item 6: the anchors survive the Windows reordering ----
+
+const COMMENTS_CT: &str =
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.comments+xml";
+
+/// The text of one paragraph carrying a bookmark around it, a comment range
+/// over it, and `word`s.
+fn anchored_paragraph(words: &str, bookmark: Option<u32>, comment: Option<u32>) -> String {
+    let mut out = String::from("<w:p>");
+    if let Some(id) = bookmark {
+        out.push_str(&format!(
+            r#"<w:bookmarkStart w:id="{id}" w:name="bm{id}"/>"#
+        ));
+    }
+    if let Some(id) = comment {
+        out.push_str(&format!(r#"<w:commentRangeStart w:id="{id}"/>"#));
+    }
+    out.push_str(&format!(
+        r#"<w:r><w:t xml:space="preserve">{words}</w:t></w:r>"#
+    ));
+    if let Some(id) = comment {
+        out.push_str(&format!(
+            r#"<w:commentRangeEnd w:id="{id}"/><w:r><w:rPr><w:rStyle w:val="CommentReference"/></w:rPr><w:commentReference w:id="{id}"/></w:r>"#
+        ));
+    }
+    if let Some(id) = bookmark {
+        out.push_str(&format!(r#"<w:bookmarkEnd w:id="{id}"/>"#));
+    }
+    out.push_str("</w:p>");
+    out
+}
+
+/// A package with one comment definition `id` saying `text`, and the given
+/// body.
+fn with_comment_and_body(body: &str, comment: &str) -> Vec<u8> {
+    let comments = format!(
+        r#"<w:comments xmlns:w="{W_NS}"><w:comment w:id="1" w:author="Ada" w:date="2026-10-07T00:00:00Z" w:initials="AL"><w:p><w:r><w:t xml:space="preserve">{comment}</w:t></w:r></w:p></w:comment></w:comments>"#
+    );
+    docx::docx_with(
+        body,
+        &[Part {
+            name: "word/comments.xml",
+            content_type: COMMENTS_CT,
+            rel_type: "http://schemas.openxmlformats.org/officeDocument/2006/relationships/comments",
+            xml: &comments,
+        }],
+    )
+}
+
+/// The Windows passes move runs and paragraphs around replaced blocks; the
+/// comment ranges, bookmarks and move ranges must stay paired and ordered
+/// afterwards: every range start precedes its end, every comment range
+/// start precedes its reference, and every bookmark and move pair keeps
+/// one start and one end.
+#[test]
+fn comment_bookmark_and_move_anchors_survive_the_windows_reordering() {
+    let moved = "First moved block of enough words for the move detector to see it as a move";
+    let fillers: Vec<String> = [
+        "Second paragraph with its own words",
+        "Third paragraph says something else again",
+        "Fourth paragraph keeps yet more words",
+        "Fifth paragraph closes the list of filler",
+    ]
+    .into_iter()
+    .map(para)
+    .collect();
+    let fillers = fillers.concat();
+    let original = with_comment_and_body(
+        &format!(
+            "{}{}{}{}",
+            anchored_paragraph("Alpha beta gamma", Some(0), None),
+            para(moved),
+            fillers,
+            anchored_paragraph("One old comment text", None, Some(1)),
+        ),
+        "A comment on the old text",
+    );
+    let revised = with_comment_and_body(
+        &format!(
+            "{}{}{}{}",
+            anchored_paragraph("Alpha delta gamma", Some(0), None),
+            fillers,
+            anchored_paragraph("One new comment text", None, Some(1)),
+            para(moved),
+        ),
+        "A comment on the old text",
+    );
+    let out = redline(&original, &revised, CompareMode::WordWindows);
+    let xml = part(&out, "word/document.xml");
+    let (dom, root) = parse(&xml);
+
+    // Document order of every anchor, by id: one walk over the story, each
+    // node's position comparable across anchor kinds.
+    let order = |name: &str| -> Vec<(String, usize)> {
+        dom.descendants(root, None)
+            .into_iter()
+            .enumerate()
+            .filter(|(_, n)| dom.name_is(*n, &W::name(name)))
+            .map(|(at, n)| (dom.attribute(n, &W::id()).unwrap_or("").to_string(), at))
+            .collect()
+    };
+    for (start, end) in [
+        ("commentRangeStart", "commentRangeEnd"),
+        ("bookmarkStart", "bookmarkEnd"),
+        ("moveFromRangeStart", "moveFromRangeEnd"),
+        ("moveToRangeStart", "moveToRangeEnd"),
+    ] {
+        let starts = order(start);
+        let ends: std::collections::HashMap<String, usize> = order(end).into_iter().collect();
+        for (id, at) in starts {
+            let Some(&after) = ends.get(&id) else {
+                panic!("{start} {id} lost its {end} in:\n{xml}");
+            };
+            assert!(after > at, "{start} {id} follows its {end} in:\n{xml}");
+        }
+    }
+    // A comment's range start precedes its reference.
+    let refs: std::collections::HashMap<String, usize> =
+        order("commentReference").into_iter().collect();
+    for (id, at) in order("commentRangeStart") {
+        let Some(&reference) = refs.get(&id) else {
+            panic!("comment range {id} lost its reference in:\n{xml}");
+        };
+        assert!(
+            reference > at,
+            "comment {id}'s reference precedes its range in:\n{xml}"
+        );
+    }
+    assert!(
+        !order("commentRangeStart").is_empty(),
+        "the comment survives"
+    );
+    assert!(!order("bookmarkStart").is_empty(), "the bookmark survives");
+    assert_deletions_first(&xml, "word-windows anchors");
+    crate::common::validity::assert_word_valid_package(&out);
+}

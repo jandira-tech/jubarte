@@ -126,38 +126,62 @@ pub fn revision_wrapper(dom: &Dom, node: NodeId) -> Option<(bool, String, String
 /// [`reorder_replacements_ins_before_del`] writes. Under every element
 /// except `w:rPr`, `w:pPr` and `w:trPr` (whose `w:ins` / `w:del` are
 /// property revisions in schema order), take each maximal run of adjacent
-/// `w:ins` / `w:del` children that holds both kinds and stable-partition it:
-/// every `w:del` before every `w:ins`, the order inside each kind kept. The
-/// deleted and the inserted text each read as before; only their
-/// interleaving changes. A run in which any wrapper holds part of a field
-/// stays as it is ([`fields_complete`]): trading a deleted field's `end`
-/// for an inserted field's `begin` crosses the two fields, and Word refused
-/// the redline. Recurses into every child. Idempotent and text-preserving
-/// (#2550).
+/// revision children — a `w:ins` or `w:del`, or a `w:hyperlink` whose
+/// element children are all one of them by one author and date, as
+/// [`revision_wrapper`] classifies — and stable-partition each same
+/// `(author, date)` group of it: every `w:del` before every `w:ins`, the
+/// order inside each kind kept (#2555). One author's replacement never
+/// fuses with another's: `[del A][ins B][del C][ins D]` with A/B by one
+/// author and C/D by another stays two replacements, and a del and an ins
+/// by different authors never trade, as the Mac pass only swaps
+/// same-author/date pairs. The deleted and the inserted text each read as
+/// before; only their interleaving changes. A group in which any wrapper
+/// holds part of a field stays as it is ([`fields_complete`]): trading a
+/// deleted field's `end` for an inserted field's `begin` crosses the two
+/// fields, and Word refused the redline. Recurses into every child.
+/// Idempotent and text-preserving (#2550).
 pub fn reorder_deletions_before_insertions(dom: &mut Dom, node: NodeId) {
     let fld_char = W::fld_char();
-    let (ins, del) = (W::ins(), W::del());
     let property_bag = [W::r_pr(), W::p_pr(), W::tr_pr()];
     if dom.child_count(node) > 1 && dom.name(node).is_none_or(|n| !property_bag.contains(&n)) {
         let kids = dom.nodes(node);
         let mut start = 0;
         while start < kids.len() {
-            if !is_ins_or_del(dom, kids[start]) {
+            if revision_wrapper(dom, kids[start]).is_none() {
                 start += 1;
                 continue;
             }
             let mut end = start;
-            while end < kids.len() && is_ins_or_del(dom, kids[end]) {
+            while end < kids.len() && revision_wrapper(dom, kids[end]).is_some() {
                 end += 1;
             }
             let run = &kids[start..end];
-            let has_del = run.iter().any(|&c| dom.name_is(c, &del));
-            let has_ins = run.iter().any(|&c| dom.name_is(c, &ins));
-            if has_del && has_ins && run.iter().all(|&c| fields_complete(dom, c, &fld_char)) {
-                let (dels, inss): (Vec<NodeId>, Vec<NodeId>) =
-                    run.iter().copied().partition(|&c| dom.name_is(c, &del));
-                let order: Vec<NodeId> = dels.into_iter().chain(inss).collect();
-                order_siblings(dom, node, run, &order, kids.get(end).copied());
+            let mut group_start = 0;
+            while group_start < run.len() {
+                let (_, author, date) = revision_wrapper(dom, run[group_start]).unwrap();
+                let mut group_end = group_start;
+                while group_end < run.len()
+                    && revision_wrapper(dom, run[group_end])
+                        .is_some_and(|(_, a, d)| a == author && d == date)
+                {
+                    group_end += 1;
+                }
+                let group = &run[group_start..group_end];
+                let kind =
+                    |&c: &NodeId| revision_wrapper(dom, c).is_some_and(|(inserted, _, _)| inserted);
+                let has_del = group.iter().any(|&c| !kind(&c));
+                let has_ins = group.iter().any(&kind);
+                if has_del && has_ins && group.iter().all(|&c| fields_complete(dom, c, &fld_char)) {
+                    let (dels, inss): (Vec<NodeId>, Vec<NodeId>) =
+                        group.iter().copied().partition(|&c| !kind(&c));
+                    let order: Vec<NodeId> = dels.into_iter().chain(inss).collect();
+                    let after = run
+                        .get(group_end)
+                        .copied()
+                        .or_else(|| kids.get(end).copied());
+                    order_siblings(dom, node, group, &order, after);
+                }
+                group_start = group_end;
             }
             start = end;
         }
@@ -174,16 +198,29 @@ pub fn reorder_deletions_before_insertions(dom: &mut Dom, node: NodeId) {
 /// passes write Mac Word's order, the inserted block first; the Windows
 /// pipeline runs this pass in their place, once they have settled the
 /// paragraphs. Under every `w:body`, `w:tc`, `w:footnote`, `w:endnote`,
-/// `w:hdr` and `w:ftr`, take each maximal run of adjacent whole-deleted and
-/// whole-inserted paragraphs that holds both kinds and stable-partition it,
-/// deletions first.
+/// `w:hdr`, `w:ftr`, `w:txbxContent`, `w:sdtContent` and `w:comment`, take
+/// each maximal run of adjacent whole-deleted and whole-inserted
+/// paragraphs that holds both kinds and stable-partition it, deletions
+/// first (#2555: the merge pass [`merge_replaced_paragraphs_in`] already
+/// walks the text-box, content-control and comment bodies, and so does
+/// this pass; a `w:tbl` or `w:sdt` block between two paragraphs ends the
+/// run, so no paragraph ever trades across one).
 ///
 /// A paragraph is whole-deleted when its mark is deleted (`w:pPr/w:rPr/w:del`
-/// and no `w:ins` there) and every `w:r` in it has a `w:del` for its direct
-/// parent; whole-inserted is the same with the two swapped. A paragraph
-/// with no run counts by its mark alone. Any other node, a mixed paragraph
-/// or one whose mark and runs disagree ends the run. Stable, so accepting
-/// and rejecting each read the same text as before. Idempotent (#2550).
+/// and no `w:ins` there) and every `w:r` in it is covered by a `w:del`
+/// between it and the paragraph (directly under the wrapper, or behind a
+/// `w:hyperlink`, `w:sdt`, `w:smartTag` or `w:fldSimple` the wrapper holds,
+/// as a text box's story is behind its drawing's run); whole-inserted is
+/// the same with the two swapped (#2555). A paragraph with no run counts
+/// by its mark alone. A paragraph whose `w:pPr` carries a `w:sectPr` — a
+/// section break — counts as neither: it ends a section where it stands
+/// and keeps its place, as the merge pass family's own guard keeps it
+/// (`merge_replaced_in_container`). The body's last paragraph, when it
+/// holds no run — the story's final pilcrow, which Word never deletes —
+/// also keeps its place: the story-tail passes have already settled which
+/// paragraph closes the story. Any other node, a mixed paragraph or one
+/// whose mark and runs disagree ends the run. Stable, so accepting and
+/// rejecting each read the same text as before. Idempotent (#2550).
 pub fn reorder_deleted_paragraphs_before_inserted(dom: &mut Dom, root: NodeId) {
     let containers = [
         W::body(),
@@ -192,16 +229,26 @@ pub fn reorder_deleted_paragraphs_before_inserted(dom: &mut Dom, root: NodeId) {
         W::endnote(),
         W::hdr(),
         W::ftr(),
+        W::txbx_content(),
+        W::sdt_content(),
+        W::comment(),
     ];
     for container in dom.descendants_and_self(root, None) {
         if !dom.name(container).is_some_and(|n| containers.contains(&n)) {
             continue;
         }
-        let kids: Vec<(NodeId, Option<bool>)> = dom
+        let mut kids: Vec<(NodeId, Option<bool>)> = dom
             .nodes(container)
             .into_iter()
             .map(|k| (k, whole_revision_kind(dom, k)))
             .collect();
+        if dom.name_is(container, &W::body())
+            && let Some(last) = kids.iter().rposition(|&(k, _)| dom.name_is(k, &W::p()))
+            && kids[last].1.is_some()
+            && dom.descendants(kids[last].0, Some(&W::r())).is_empty()
+        {
+            kids[last].1 = None;
+        }
         let mut start = 0;
         while start < kids.len() {
             if kids[start].1.is_none() {
@@ -243,26 +290,51 @@ fn whole_revision_kind(dom: &Dom, p: NodeId) -> Option<bool> {
     if !dom.name_is(p, &W::p()) {
         return None;
     }
-    let mark = dom
-        .element(p, &W::p_pr())
-        .and_then(|ppr| dom.element(ppr, &W::r_pr()));
+    let properties = dom.element(p, &W::p_pr());
+    // A paragraph-level section break ends a section exactly where it
+    // stands; trading it re-sections the document, so it counts as neither.
+    // The merge pass family keeps the same guard (merge_replaced_in_container).
+    if properties.is_some_and(|ppr| dom.element(ppr, &W::sect_pr()).is_some()) {
+        return None;
+    }
+    let mark = properties.and_then(|ppr| dom.element(ppr, &W::r_pr()));
     let mark_has = |rev: &XName| mark.is_some_and(|m| dom.element(m, rev).is_some());
     let (mark_ins, mark_del) = (mark_has(&W::ins()), mark_has(&W::del()));
     if mark_ins == mark_del {
         return None;
     }
     let runs = dom.descendants(p, Some(&W::r()));
-    let wrapper = if mark_ins { W::ins() } else { W::del() };
+    let (wrapper, other) = if mark_ins {
+        (W::ins(), W::del())
+    } else {
+        (W::del(), W::ins())
+    };
     runs.iter()
-        .all(|&r| {
-            dom.parent(r)
-                .is_some_and(|parent| dom.name_is(parent, &wrapper))
-        })
+        .all(|&r| run_covered_by(dom, r, p, &wrapper, &other))
         .then_some(mark_ins)
 }
 
-fn is_ins_or_del(dom: &Dom, node: NodeId) -> bool {
-    dom.name_is(node, &W::ins()) || dom.name_is(node, &W::del())
+/// The first `w:ins` / `w:del` between the run `r` and its paragraph `p` is
+/// `wrapper`: the run is as revised as one directly under the wrapper when
+/// the wrapper holds it behind a `w:hyperlink`, `w:sdt`, `w:smartTag` or
+/// `w:fldSimple` — or behind the drawing run of a text box whose story it
+/// carries (#2555). A run that reaches `p`, or an opposite-kind wrapper,
+/// first is not covered.
+fn run_covered_by(dom: &Dom, r: NodeId, p: NodeId, wrapper: &XName, other: &XName) -> bool {
+    let mut cur = dom.parent(r);
+    while let Some(node) = cur {
+        if node == p {
+            return false;
+        }
+        if dom.name_is(node, other) {
+            return false;
+        }
+        if dom.name_is(node, wrapper) {
+            return true;
+        }
+        cur = dom.parent(node);
+    }
+    false
 }
 
 /// Move `order`, a permutation of the adjacent children `run` of `parent`,

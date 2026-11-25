@@ -1325,8 +1325,9 @@ pub fn try_compare_bodies_faithful_with_notes(
         // #2550: Windows Word 2024 writes deletions before insertions, in a
         // paragraph and between the paragraphs of a replaced block. The
         // passes above rebuild Mac Word's order as they work, so this runs
-        // once they are done. Headers, footers and text boxes are compared
-        // through this function and get no later re-assert.
+        // once they are done. Headers and footers are compared through this
+        // function and get no later re-assert; the text boxes this function
+        // re-diffs below get one right after the graft.
         if settings.word_platform == WordPlatform::Windows {
             finalize::reorder_deletions_before_insertions(dom, root);
             finalize::reorder_deleted_paragraphs_before_inserted(dom, root);
@@ -1336,6 +1337,17 @@ pub fn try_compare_bodies_faithful_with_notes(
     // sees the box as one opaque run and deletes and inserts it whole.
     if settings.merge_replaced_paragraphs {
         textbox::diff_inside_replaced_text_boxes(dom, root, settings);
+        // #2555: the graft re-diffs each paired box's story through the
+        // recursive compare and lifts the surviving shapes out of their
+        // wrappers — the last structure-changing step of this pipeline.
+        // Windows Word's order is asserted after every other such step (the
+        // M472 re-assert, move_inserted_text_past_deleted_tables); it is
+        // asserted here too, so a grafted w:txbxContent story can never
+        // ship Mac Word's order.
+        if settings.word_platform == WordPlatform::Windows {
+            finalize::reorder_deletions_before_insertions(dom, root);
+            finalize::reorder_deleted_paragraphs_before_inserted(dom, root);
+        }
     }
     // Validity, not parity: a w:ins/w:del may not hold a w:hyperlink. Deleting a
     // whole header/footer swallowed the source's hyperlink into the w:del and Word
